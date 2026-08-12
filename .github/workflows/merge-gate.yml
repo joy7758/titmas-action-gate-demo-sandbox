@@ -1,0 +1,119 @@
+name: Merge gate demo
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ordinary-ci:
+    name: Ordinary CI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out exact pull-request head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Run ordinary tests
+        run: python -m unittest discover -s tests -v
+
+  titmas-evidence-gate:
+    name: TITMAS Evidence Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out exact pull-request head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install pinned evidence producer
+        run: python -m pip install 'git+https://github.com/joy7758/titmas-agent-action-gate.git@decb83d5a31d4b42ac5e4c1ebe65d6cf30bd7b34'
+      - name: Run evidence-producing tests
+        run: python -m unittest discover -s tests -v
+      - name: Generate subject-bound task and evidence
+        env:
+          TITMAS_DEMO_SUBJECT_SHA: ${{ vars.TITMAS_DEMO_EVIDENCE_SUBJECT_SHA }}
+          TITMAS_DEMO_PULL_REQUEST: ${{ github.event.pull_request.number }}
+          TITMAS_DEMO_REPOSITORY: ${{ github.repository }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import shutil
+          import sysconfig
+          from pathlib import Path
+
+          from titmas_action_gate.canonical import sha256_json
+          from titmas_action_gate.evidence import AgentEvidenceAdapter
+
+          subject_sha = os.environ["TITMAS_DEMO_SUBJECT_SHA"]
+          if re.fullmatch(r"[a-f0-9]{40}", subject_sha) is None:
+              raise SystemExit("TITMAS_DEMO_SUBJECT_SHA_INVALID")
+          repository = os.environ["TITMAS_DEMO_REPOSITORY"]
+          pull_request = int(os.environ["TITMAS_DEMO_PULL_REQUEST"])
+          execution_identity = "github-actions:titmas-evidence-gate"
+          test_command = ["python", "-m", "unittest", "discover", "-s", "tests", "-v"]
+          parameters = {
+              "pull_request": pull_request,
+              "head_sha": subject_sha,
+              "execution_identity": execution_identity,
+              "test_command": test_command,
+          }
+          request = {
+              "schema_version": "0.1.0",
+              "request_id": f"aar-public-demo-{subject_sha[:12]}",
+              "created_at": "2026-08-12T12:00:00Z",
+              "requested_by": {"agent_id": "request-analyst", "team_id": "titmas-action-gate"},
+              "action": "github.pull_request.merge",
+              "target": {
+                  "provider": "github",
+                  "repository": repository,
+                  "resource_ref": f"refs/pull/{pull_request}/head@{subject_sha}",
+              },
+              "parameters": parameters,
+              "parameters_sha256": sha256_json(parameters),
+              "evidence_requirements": ["SOURCE_PIN", "DIFF", "TEST_RESULT", "PULL_REQUEST_STATE"],
+              "uncertainty": [],
+              "idempotency_key": f"public-demo:{pull_request}:{subject_sha}",
+          }
+          directory = Path(".titmas")
+          directory.mkdir()
+          (directory / "task.json").write_text(json.dumps(request, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          installed_policy = (
+              Path(sysconfig.get_path("data"))
+              / "share/titmas-action-gate/policies/github-merge-gate-low-risk-demo.v0.1.json"
+          )
+          shutil.copyfile(installed_policy, directory / "policy.json")
+          adapter = AgentEvidenceAdapter(directory)
+          profile = adapter.build_profile(
+              request,
+              actor="public-demo-evidence-producer",
+              phase="pr-check",
+              operation_status="succeeded",
+              output={"test_exit_code": 0, "subject_sha": subject_sha},
+              evidence_types=request["evidence_requirements"],
+          )
+          adapter.write_profile(profile, "evidence.json")
+          PY
+      - name: Evaluate required evidence gate
+        uses: joy7758/titmas-agent-action-gate@decb83d5a31d4b42ac5e4c1ebe65d6cf30bd7b34
+        with:
+          task: .titmas/task.json
+          evidence: .titmas/evidence.json
+          policy: .titmas/policy.json
+          test-command: python -m unittest discover -s tests -v
+          execution-identity: github-actions:titmas-evidence-gate
+      - name: Retain machine receipt and human summary
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: titmas-evidence-gate-${{ github.run_attempt }}
+          path: artifacts/titmas/
+          if-no-files-found: error
+          retention-days: 30
